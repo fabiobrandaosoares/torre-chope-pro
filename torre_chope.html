@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#000000">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="Torre Choppe Pro">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>Torre Choppe Pro</title>
+<style>
+*{
+  margin:0;
+  padding:0;
+  box-sizing:border-box;
+}
+html,body{
+  width:100%;
+  height:100%;
+  background:#000;
+  overflow:hidden;
+  cursor:none;
+  touch-action:none;
+}
+#beer-video{
+  position:fixed;
+  top:0;
+  left:0;
+  width:100vw;
+  height:100vh;
+  object-fit:fill;
+  background:#000;
+}
+#status-dot{
+  position:fixed;
+  top:14px;
+  right:14px;
+  width:12px;
+  height:12px;
+  border-radius:50%;
+  background:#555;
+  z-index:20;
+}
+#status-dot.conectado{
+  background:#00ff66;
+  box-shadow:0 0 12px #00ff66;
+}
+#status-dot.aguardando{
+  background:#ffaa00;
+  box-shadow:0 0 12px #ffaa00;
+}
+#status-dot.erro{
+  background:#ff0033;
+  box-shadow:0 0 12px #ff0033;
+}
+#btn-setup, #btn-install{
+  position:fixed;
+  left:50%;
+  bottom:30px;
+  transform:translateX(-50%);
+  z-index:30;
+  background:rgba(0,0,0,0.82);
+  border:1px solid rgba(255,180,0,0.5);
+  color:#f5d020;
+  padding:14px 38px;
+  border-radius:40px;
+  font-size:1rem;
+  font-weight:600;
+  font-family:sans-serif;
+  opacity:0;
+  pointer-events:none;
+  transition:0.4s;
+}
+#btn-setup.visible, #btn-install.visible{
+  opacity:1;
+  pointer-events:all;
+}
+#toast{
+  position:fixed;
+  top:50%;
+  left:50%;
+  transform:translate(-50%,-50%);
+  background:rgba(0,0,0,0.82);
+  color:#fff;
+  padding:14px 30px;
+  border-radius:40px;
+  z-index:50;
+  opacity:0;
+  transition:0.3s;
+  font-family:sans-serif;
+}
+#toast.show{
+  opacity:1;
+}
+</style>
+</head>
+<body>
+<video id="beer-video" src="video_v3.mp4" preload="auto" playsinline muted></video>
+<div id="status-dot"></div>
+<button id="btn-setup">🔌 Conectar Arduino</button>
+<button id="btn-install">📱 Instalar Torre Choppe Pro</button>
+<div id="toast"></div>
+
+<script>
+// =====================================================
+// CONFIG - TORRE CHOPPE PRO
+// =====================================================
+const CFG = {
+  BAUD:9600,
+  MAX_ML:2000,
+  T1_END:5,
+  T_TOTAL:15,
+  RETRY_MS:4000,
+  MAX_BUFFER:2048,
+  MAX_RETRIES:10,
+  CARD:['CARD','CARTAO','START','OK'],
+  FLOW:'FLOW:',
+  RESET:'RESET'
+};
+
+// =====================================================
+// ELEMENTOS
+// =====================================================
+const video = document.getElementById('beer-video');
+const toastEl = document.getElementById('toast');
+const btnSetup = document.getElementById('btn-setup');
+const btnInstall = document.getElementById('btn-install');
+const statusDot = document.getElementById('status-dot');
+
+// =====================================================
+// ESTADOS
+// =====================================================
+const S = {
+  IDLE:0,
+  ENCHENDO:1,
+  CHEIO:2,
+  SERVINDO:3,
+  FINALIZADO:4
+};
+let state = S.IDLE;
+
+// =====================================================
+// VARIÁVEIS GLOBAIS
+// =====================================================
+let reconnectTimer = null;
+let retryCount = 0;
+let lastFlow = Date.now();
+
+// =====================================================
+// TOAST
+// =====================================================
+function showToast(msg, d=3000){
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  setTimeout(()=>{
+    toastEl.classList.remove('show');
+  }, d);
+}
+
+// =====================================================
+// STATUS DOT
+// =====================================================
+function setDot(s){
+  statusDot.className = '';
+  statusDot.classList.add(s);
+}
+
+// =====================================================
+// MÁQUINA DE ESTADOS
+// =====================================================
+function go(s){
+  state = s;
+  console.log('🗿 Estado:', Object.keys(S)[s], s);
+}
+
+// =====================================================
+// VÍDEO EVENTOS
+// =====================================================
+video.addEventListener('timeupdate', ()=>{
+  if(state === S.ENCHENDO && video.currentTime >= CFG.T1_END){
+    video.pause();
+    video.currentTime = CFG.T1_END;
+    go(S.CHEIO);
+  }
+});
+
+// =====================================================
+// SMOOTH SEEK
+// =====================================================
+function smoothSeek(target){
+  function step(){
+    let diff = target - video.currentTime;
+    if(Math.abs(diff) < 0.03){
+      video.currentTime = target;
+      return;
+    }
+    video.currentTime += diff * 0.15;
+    requestAnimationFrame(step);
+  }
+  step();
+}
+
+// =====================================================
+// EVENTOS SERIAL
+// =====================================================
+function onCard(){
+  if(state !== S.IDLE) return;
+  video.currentTime = 0;
+  video.play().catch(e => console.error('Vídeo erro:', e));
+  showToast('🎉 Cartão detectado!');
+  go(S.ENCHENDO);
+}
+
+function onFlow(ml){
+  lastFlow = Date.now();
+  if(state !== S.CHEIO && state !== S.SERVINDO) return;
+  
+  let vol = Math.min(ml, CFG.MAX_ML);
+  let proporcao = vol / CFG.MAX_ML;
+  let novoTempo = CFG.T1_END + (proporcao * (CFG.T_TOTAL - CFG.T1_END));
+  
+  smoothSeek(novoTempo);
+  
+  if(state === S.CHEIO){
+    showToast(`🍺 Servindo ${Math.round(vol)}ml`);
+    go(S.SERVINDO);
+  }
+  
+  if(vol >= CFG.MAX_ML){
+    showToast('✅ Choppe completo!');
+    go(S.FINALIZADO);
+    setTimeout(reset, 5000);
+  }
+}
+
+function reset(){
+  video.pause();
+  video.currentTime = 0;
+  go(S.IDLE);
+  showToast('🔄 Pronto para novo cartão');
+}
+
+// =====================================================
+// WATCHDOG FLOW
+// =====================================================
+setInterval(()=>{
+  if(state === S.SERVINDO && Date.now() - lastFlow > 8000){
+    showToast('⚠️ Fluxo interrompido');
+    reset();
+  }
+}, 1000);
+
+// =====================================================
+// PARSER SERIAL
+// =====================================================
+function parseLine(raw){
+  const l = raw.trim().toUpperCase();
+  if(!l) return;
+
+  if(CFG.CARD.some(k => l.includes(k))){
+    onCard();
+    return;
+  }
+
+  if(l.includes(CFG.RESET)){
+    reset();
+    return;
+  }
+
+  let n;
+  if(l.startsWith(CFG.FLOW)){
+    n = parseFloat(l.slice(CFG.FLOW.length));
+  } else {
+    n = parseFloat(l);
+  }
+
+  if(!isNaN(n) && n >= 0){
+    onFlow(n);
+  } else {
+    console.warn('Comando inválido:', l);
+  }
+}
+
+// =====================================================
+// SERIAL CONNECTION
+// =====================================================
+async function openPort(port){
+  try{
+    await port.open({ baudRate: CFG.BAUD });
+    btnSetup.classList.remove('visible');
+    setDot('conectado');
+    showToast('✅ Arduino conectado!');
+    retryCount = 0;
+    readLoop(port);
+  } catch(e){
+    console.error('Porta erro:', e);
+    setDot('erro');
+    showToast('❌ Erro na porta serial');
+  }
+}
+
+async function readLoop(port){
+  const dec = new TextDecoderStream();
+  const readableClosed = port.readable.pipeTo(dec.writable);
+  const reader = dec.readable.getReader();
+  let buf = '';
+
+  try{
+    while(true){
+      const {value, done} = await reader.read();
+      if(done) break;
+
+      buf += value;
+      
+      if(buf.length > CFG.MAX_BUFFER){
+        console.warn('Buffer reset');
+        buf = buf.slice(-512);
+      }
+
+      const parts = buf.split('\n');
+      buf = parts.pop() || '';
+
+      parts.forEach(parseLine);
+    }
+  } catch(e){
+    console.error('Leitura erro:', e);
+  }
+
+  await readableClosed.catch(e => console.error('Stream erro:', e));
+  port.close().catch(console.error);
+  
+  setDot('aguardando');
+  scheduleReconnect();
+}
+
+function scheduleReconnect(){
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(async () => {
+    if(retryCount >= CFG.MAX_RETRIES){
+      setDot('erro');
+      showToast('🔄 Verifique Arduino');
+      btnSetup.classList.add('visible');
+      return;
+    }
+    
+    try{
+      const ports = await navigator.serial.getPorts();
+      if(ports.length > 0){
+        await openPort(ports[0]);
+      } else {
+        retryCount++;
+        scheduleReconnect();
+      }
+    } catch(e){
+      console.error('Reconnect:', e);
+      retryCount++;
+      scheduleReconnect();
+    }
+  }, CFG.RETRY_MS);
+}
+
+// =====================================================
+// AUTO CONNECT
+// =====================================================
+async function autoConnect(){
+  if(!('serial' in navigator)){
+    setDot('erro');
+    showToast('❌ Use Chrome/Edge');
+    return;
+  }
+
+  setDot('aguardando');
+  
+  try{
+    const ports = await navigator.serial.getPorts();
+    if(ports.length > 0){
+      await openPort(ports[0]);
+    } else {
+      btnSetup.classList.add('visible');
+      btnSetup.addEventListener('click', async () => {
+        try{
+          const port = await navigator.serial.requestPort();
+          await openPort(port);
+        } catch(e){
+          showToast('❌ Conexão cancelada');
+        }
+      }, {once: true});
+    }
+  } catch(e){
+    console.error('AutoConnect:', e);
+    setDot('erro');
+  }
+}
+
+// =====================================================
+// WAKE LOCK
+// =====================================================
+async function keepAwake(){
+  if('wakeLock' in navigator){
+    try{
+      await navigator.wakeLock.request('screen');
+      console.log('Tela sempre ligada');
+    } catch(e){
+      console.error('WakeLock:', e);
+    }
+  }
+}
+
+// =====================================================
+// VÍDEO WATCHDOG
+// =====================================================
+setInterval(()=>{
+  if(video.readyState < 2){
+    video.load();
+  }
+}, 5000);
+
+// =====================================================
+// PWA INSTALL
+// =====================================================
+let deferredInstall = null;
+window.addEventListener('beforeinstallprompt', e => {
+  e.preventDefault();
+  deferredInstall = e;
+  btnInstall.classList.add('visible');
+});
+
+btnInstall.addEventListener('click', async () => {
+  if(!deferredInstall) return;
+  try{
+    await deferredInstall.prompt();
+  } catch(e){
+    console.error('Install:', e);
+  }
+  btnInstall.classList.remove('visible');
+  deferredInstall = null;
+});
+
+// =====================================================
+// SERVICE WORKER
+// =====================================================
+if('serviceWorker' in navigator){
+  navigator.serviceWorker.register('./sw.js')
+    .then(() => console.log('🛠️ SW registrado'))
+    .catch(e => console.error('SW erro:', e));
+}
+
+// =====================================================
+// INICIALIZAÇÃO
+// =====================================================
+keepAwake();
+autoConnect();
+</script>
+</body>
+</html>
